@@ -9,14 +9,16 @@
 #define DUTY_CH ADC_Channel_2
 #define FREQ_CH ADC_Channel_0
 
-static void ADC_Function_Init(void)
-{
+/**
+ * Init ADC in injected sequence mode for potentiometer readings
+ */
+static void ADC_Function_Init(void) {
     GPIO_InitTypeDef GPIO_InitStructure = {
         .GPIO_Mode = GPIO_Mode_AIN
     };
 
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOC | RCC_APB2Periph_GPIOA | RCC_APB2Periph_ADC1, ENABLE);
-    RCC_ADCCLKConfig(RCC_PCLK2_Div8);
+    RCC_ADCCLKConfig(RCC_PCLK2_Div24);
 
     // Setup gpio inputs used for analog readings
     GPIO_InitStructure.GPIO_Pin = GPIO_Pin_4;
@@ -35,17 +37,16 @@ static void ADC_Function_Init(void)
     };
     ADC_Init(ADC1, &ADC_InitStructure);
 
-    ADC_InjectedSequencerLengthConfig(ADC1, 2);
-    ADC_InjectedChannelConfig(ADC1, DUTY_CH, 1, ADC_SampleTime_241Cycles);
-    ADC_InjectedChannelConfig(ADC1, FREQ_CH, 2, ADC_SampleTime_241Cycles);
+    ADC_InjectedSequencerLengthConfig(ADC1, 1); // configure the sequence channel later, right before conv is triggered
+    ADC_ExternalTrigInjectedConvCmd(ADC1, DISABLE);
 
-    // ADC_DiscModeChannelCountConfig(ADC1, 1);
     ADC_Calibration_Vol(ADC1, ADC_CALVOL_50PERCENT);
+    ADC_AutoInjectedConvCmd(ADC1, ENABLE);
     // ADC_InjectedDiscModeCmd(ADC1, ENABLE);
     // ADC_ExternalTrigInjectedConvCmd(ADC1, ENABLE);
-    ADC_AutoInjectedConvCmd(ADC1, ENABLE);
     ADC_Cmd(ADC1, ENABLE);
 
+    // run calibration for (slightly) more accurate results
     ADC_ResetCalibration(ADC1);
     while (ADC_GetResetCalibrationStatus(ADC1));
     ADC_StartCalibration(ADC1);
@@ -53,7 +54,7 @@ static void ADC_Function_Init(void)
 }
 
 /**
- * 
+ * Configure Timer1 to drive LED with PWM for brightness control
  */
 static void TIM1_PWM_In(u16 arr, u16 psc, u16 ccp) {
     TIM_OCInitTypeDef TIM_OCInitStructure={0};
@@ -80,8 +81,7 @@ static void TIM1_PWM_In(u16 arr, u16 psc, u16 ccp) {
 
     TIM_OCInitStructure.TIM_OutputState = TIM_OutputState_Enable;
     TIM_OCInitStructure.TIM_Pulse = ccp;
-    TIM_OCInitStructure.TIM_OCPolarity = TIM_OCPolarity_Low;
-    // TIM_OC1Init(TIM1, &TIM_OCInitStructure);
+    TIM_OCInitStructure.TIM_OCPolarity = TIM_OCPolarity_High; // output high when timer value > cmp
     TIM_OC2Init(TIM1, &TIM_OCInitStructure); // Output channel 2 (PA1)
 
     TIM_CtrlPWMOutputs(TIM1, ENABLE);
@@ -90,48 +90,45 @@ static void TIM1_PWM_In(u16 arr, u16 psc, u16 ccp) {
     TIM_Cmd(TIM1, ENABLE);
 }
 
-static void adc_trigger() {
-    ADC_SoftwareStartConvCmd(ADC1, ENABLE);
-    while(!ADC_GetFlagStatus(ADC1, ADC_FLAG_EOC));
-    ADC_ClearFlag(ADC1, ADC_FLAG_EOC);
-    while(!ADC_GetFlagStatus(ADC1, ADC_FLAG_JEOC));
-    ADC_ClearFlag(ADC1, ADC_FLAG_JEOC);
+static uint16_t adc_read(uint8_t ch) {
+    ADC_ClearFlag(ADC1, ADC_JEOC);
+    ADC_InjectedChannelConfig(ADC1, ch, 1, ADC_SampleTime_241Cycles); // set injected channel to take reading from
+    ADC_SoftwareStartInjectedConvCmd(ADC1, ENABLE); // trigger injected conversion
+    while (!ADC_GetFlagStatus(ADC1, ADC_JEOC)); // wait for injected reading complete flag
+    return ADC_GetInjectedConversionValue(ADC1, ADC_InjectedChannel_1);
 }
-
 
 int main() {
 	NVIC_PriorityGroupConfig(NVIC_PriorityGroup_1);
     SystemCoreClockUpdate();
     Delay_Init();
 
-    // LED_GPIO_Init();
     ADC_Function_Init();
-    TIM1_PWM_In(1000, 48000 - 1, 0); // Period, timer prescaler, initial compare value
+    TIM1_PWM_In(1000, 240 - 1, 0); // Period, timer prescaler, initial compare value
 
-    uint32_t duty_pot, freq_pot, period, on_t, off_t;
+    uint16_t duty_pot, freq_pot, period, on_t, off_t;
     uint16_t i;
 
     for (;;) {
-        adc_trigger();
-        // ADC is 10bit so raw idata readings go from 0-0x3ff
-        duty_pot = ADC1->IDATAR1;
-        freq_pot = ADC1->IDATAR2;
+        // ADC is 10bit so raw readings go from 0-0x3ff
+        duty_pot = adc_read(DUTY_CH);
+        freq_pot = adc_read(FREQ_CH);
 
         // Calculate timings for next cycle
-        period = (freq_pot << 3) + 1000; // approx 1-9s
+        period = (freq_pot << 2) + 500; // approx 1-5s (avoid mul and div if possible due to lack of hw instruction for these)
         on_t = period * duty_pot / 0x3ff;
         off_t = period - on_t;
 
         // Update PWM cycle
-        for (i = 0; i < 1000; ++i) {
+        for (i = 0; i < 1000; ++i) { // brightness ramp up
             TIM_SetCompare2(TIM1, i);
-            Delay_Us(100);
+            Delay_Us(75);
         }
         TIM_SetCompare2(TIM1, 1000); // always on
         Delay_Ms(on_t); // On time
-        for (i = 1000; i > 0; --i) {
+        for (i = 1000; i > 0; --i) { // brightness ramp down
             TIM_SetCompare2(TIM1, i);
-            Delay_Us(100);
+            Delay_Us(75);
         }
         TIM_SetCompare2(TIM1, 0); // always off
         Delay_Ms(off_t); // Off time
